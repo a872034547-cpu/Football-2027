@@ -1,0 +1,28 @@
+{
+  "name": "football-prediction-automation-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "足球预测自动化服务端",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "check": "node --check src/index.js",
+    "doctor": "node scripts/doctor.mjs",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "test": "npm run check && node tests/test-enhancement-engine.mjs && node tests/test-snapshot-to-stored.mjs && node tests/test-match-analyzer.mjs && node tests/test-p0-closedloop.mjs && node tests/test-db-e2e.mjs",
+    "test:full": "npm test && node tests/test-result-sync-simple.mjs && node tests/test-result-sync-pipeline.mjs && node tests/test-elo-service.mjs",
+    "test:optional:elo-api": "node tests/test-elo-api.mjs",
+    "test:optional:sporttery": "node tests/test-sporttery-api.mjs",
+    "acceptance": "node scripts/acceptance-full.mjs",
+    "acceptance:live": "node scripts/acceptance-full.mjs --live"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.53.0",
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "node-cron": "^4.1.0"
+  },
+  "devDependencies": {}
+}

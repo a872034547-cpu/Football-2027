@@ -1,0 +1,131 @@
+# docker-compose.hermes.yml - Hermes Studio + Football Auto 完整部署
+# 使用方式：
+#   1. cp .env.hermes.example .env
+#   2. 编辑 .env，填写必填项（AI 配置、推送 Webhook 等）
+#   3. docker compose -f docker-compose.hermes.yml up -d
+
+services:
+
+  # ─────────────────────────────────────────────────────────────
+  # Hermes Studio Web UI — 可视化控制台 / Agent 中枢
+  # 默认访问：http://服务器IP:6060
+  # 首次登录账号：admin / 123456  ← 请立即修改密码
+  # Token 查看：cat ./hermes_data/hermes-web-ui/.token
+  # ─────────────────────────────────────────────────────────────
+  hermes-webui:
+    image: ${WEBUI_IMAGE:-ekkoye8888/hermes-web-ui}
+    container_name: hermes-webui
+    init: true
+    ports:
+      - "${HERMES_PORT:-6060}:6060"
+    volumes:
+      - ${HERMES_DATA_DIR:-./hermes_data}/hermes:/home/agent/.hermes
+      - ${HERMES_DATA_DIR:-./hermes_data}/hermes-web-ui:/home/agent/.hermes-web-ui
+    environment:
+      - PORT=6060
+      - HERMES_HOME=/home/agent/.hermes
+      - HERMES_WEB_UI_MANAGED_GATEWAY=1
+      - HERMES_ALLOW_ROOT_GATEWAY=1
+      # 供 Hermes Agent 通过内网调用足球服务
+      - FOOTBALL_AUTO_BASE_URL=http://football-auto:${APP_PORT:-3000}
+    depends_on:
+      football-auto:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:6060').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: unless-stopped
+    networks:
+      - football-net
+
+  # ─────────────────────────────────────────────────────────────
+  # Football Auto — 足球预测能力服务
+  # 默认访问：http://服务器IP:3000
+  # 健康检查：http://服务器IP:3000/health
+  # 任务状态：http://服务器IP:3000/api/jobs/status
+  # ─────────────────────────────────────────────────────────────
+  football-auto:
+    build:
+      context: .
+    container_name: football-auto
+    init: true
+    env_file:
+      - ${FOOTBALL_ENV_FILE:-.env}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    # 已独立化：分析引擎内置于镜像 server/src/analysis/engines/，不再挂载外部 js/
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/health').then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status))).then(j=>process.exit(j.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+    restart: unless-stopped
+    networks:
+      - football-net
+
+  # ─────────────────────────────────────────────────────────────
+  # NapCat + OneBot（可选）— QQ 推送网关
+  # 如需 QQ 推送，取消下面的注释，配置 QQ 号和 ONEBOT_* 变量
+  # ─────────────────────────────────────────────────────────────
+  # napcat:
+  #   image: mlikiowa/napcat-docker:latest
+  #   container_name: napcat
+  #   restart: unless-stopped
+  #   environment:
+  #     - ACCOUNT=你的QQ号
+  #     - NAPCAT_GoCQ_HTTP=true
+  #     - NAPCAT_GoCQ_HTTP_PORT=3001
+  #   volumes:
+  #     - ./napcat:/app/napcat/config
+  #   ports:
+  #     - "3001:3001"
+  #   networks:
+  #     - football-net
+
+  # ─────────────────────────────────────────────────────────────
+  # Nginx/Caddy 反代（可选）— 域名 HTTPS 接入
+  # 如有域名可启用，对外提供统一入口
+  # ─────────────────────────────────────────────────────────────
+  # caddy:
+  #   image: caddy:alpine
+  #   container_name: caddy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - ./caddy/data:/data
+  #     - ./caddy/config:/config
+  #   networks:
+  #     - football-net
+
+networks:
+  football-net:
+    driver: bridge

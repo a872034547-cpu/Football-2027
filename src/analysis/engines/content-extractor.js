@@ -1,0 +1,1225 @@
+/**
+ * content-extractor.js
+ * 注入到球探网页面，直接从 DOM 提取数据，再通过消息发回 background
+ */
+(function() {
+  const url = location.href;
+
+  function extractAndSend() {
+    let data = null;
+    let type = null;
+
+    if (url.includes('/analysis/')) {
+      data = extractAnalysis();
+      type = 'analysis';
+    } else if (url.includes('1x2.titan007.com/oddslist/')) {
+      data = extractWinDrawWin();
+      type = 'winDrawWin';
+    } else if (url.includes('goalCount.aspx')) {
+      data = extractWinDrawWinStats();
+      type = 'winDrawWinStats';
+    } else if (url.includes('AsianOdds_n.aspx')) {
+      data = extractAsian();
+      type = 'asian';
+    } else if (url.includes('OverDown_n.aspx')) {
+      data = extractOverUnder();
+      type = 'overunder';
+    } else if (url.includes('Corner.aspx')) {
+      data = extractCorner();
+      type = 'corner';
+    }
+
+    if (data && type) {
+      // 提取 matchId：analysis/oddslist 用路径，vip 页面用 id/sid 参数
+      const idM = url.match(/[?&](?:id|sid)=(\d{6,8})/) || url.match(/\/(\d{6,8})(?=\D|$)/);
+      const matchId = idM ? idM[1] : null;
+
+      chrome.runtime.sendMessage({
+        type: 'PAGE_DATA',
+        dataType: type,
+        matchId,
+        data
+      });
+    }
+  }
+
+  // ===== 赛前分析提取 =====
+  function extractAnalysis() {
+    const result = {
+      matchInfo: {}, homeStats: {}, awayStats: {}, homeHalfStats: {}, awayHalfStats: {},
+      handicapTrend: { home: {}, away: {} },
+      sameHandicapHistory: [],
+      recentGoalDistribution: { home: null, away: null },
+      halfFull: { home: null, away: null },
+      goalSingleDouble: {},
+      goalTimeDistribution: {},
+      seasonComparison: { home: {}, away: {} },
+      dataComparison: { home: {}, away: {} }
+    };
+
+    // 比赛时间
+    const timeEl = document.body.innerText.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})/);
+    if (timeEl) result.matchInfo.time = timeEl[1] + ' ' + timeEl[2];
+
+    // 天气
+    const text = document.body.innerText;
+    const weatherM = text.match(/天气[：:]\s*([^\s\n]{1,10})/);
+    if (weatherM) result.matchInfo.weather = weatherM[1];
+    const tempM = text.match(/温度[：:]\s*([^\n<]{2,20})/);
+    if (tempM) result.matchInfo.temperature = tempM[1].trim();
+
+    // 主客队名称
+    const imgs = document.querySelectorAll('img[alt]');
+    const names = [];
+    imgs.forEach(img => {
+      const alt = img.alt.trim();
+      if (alt && alt.length >= 2 && alt.length <= 20 &&
+          !alt.match(/^\d/) && names.indexOf(alt) === -1 &&
+          !['image','icon','logo','banner'].some(k => alt.toLowerCase().includes(k))) {
+        names.push(alt);
+      }
+    });
+    result.matchInfo.home = names[0] || '';
+    result.matchInfo.away = names[1] || '';
+
+    // 联赛名称
+    const leagueM = text.match(/(\d{4}-\d{4})赛季([^\n\-（(]{2,20})/);
+    if (leagueM) result.matchInfo.league = leagueM[2].trim();
+
+    // 解析战绩表格
+    const tables = document.querySelectorAll('table');
+    let teamTableIndex = 0;
+    tables.forEach(tbl => {
+      const rows = Array.from(tbl.querySelectorAll('tr'));
+      const headers = rows[0] ? Array.from(rows[0].querySelectorAll('td,th')).map(c => c.textContent.trim()) : [];
+      // 找到包含"赛"、"胜"、"平"、"负"的表格
+      if (headers.some(h => h === '赛' || h === '胜')) {
+        const statsObj = {};
+        rows.forEach(row => {
+          const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
+          if (cells[0] === '总' && cells.length >= 8) {
+            statsObj.total = {
+              played: cells[1], win: cells[2], draw: cells[3], loss: cells[4],
+              goalsFor: cells[5], goalsAgainst: cells[6], diff: cells[7],
+              points: cells[8] || '', rank: cells[9] || '', winRate: cells[10] || ''
+            };
+          }
+          if (cells[0] === '近6' || cells[0] === '近6场') {
+            statsObj.last6 = {
+              played: 6, win: cells[2], draw: cells[3], loss: cells[4],
+              goalsFor: cells[5], goalsAgainst: cells[6]
+            };
+          }
+          if (cells[0] === '主' || cells[0] === '主场') {
+            statsObj.home = {
+              played: cells[1], win: cells[2], draw: cells[3], loss: cells[4],
+              goalsFor: cells[5], goalsAgainst: cells[6], winRate: cells[10] || ''
+            };
+          }
+          if (cells[0] === '客' || cells[0] === '客场') {
+            statsObj.away = {
+              played: cells[1], win: cells[2], draw: cells[3], loss: cells[4],
+              goalsFor: cells[5], goalsAgainst: cells[6], winRate: cells[10] || ''
+            };
+          }
+        });
+        if (Object.keys(statsObj).length > 0) {
+          if (teamTableIndex === 0) result.homeStats = statsObj;
+          else if (teamTableIndex === 1) result.awayStats = statsObj;
+          else if (teamTableIndex === 2) result.homeHalfStats = statsObj;
+          else if (teamTableIndex === 3) result.awayHalfStats = statsObj;
+          teamTableIndex++;
+        }
+      }
+    });
+
+    // 盘路走势：表格优先，文本兜底。报告读取的是 home/away 结构，不能再只写 homeWinRate。
+    const compact = v => (v || '').replace(/\s+/g, '').trim();
+    const pctFromText = v => {
+      const m = String(v || '').match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+      return m ? m[1] : '';
+    };
+    const getCells = row => Array.from(row.querySelectorAll('th,td')).map(c => c.textContent.trim().replace(/\s+/g, ' '));
+    const rowLabel = (cells, rowText) => {
+      const first = compact(cells[0] || '');
+      if (/近6|近六/.test(rowText) || first === '近6' || first === '近6场') return 'last6';
+      if (first === '总' || first === '全部' || first === '全场') return 'total';
+      if (first === '主' || first === '主场') return 'home';
+      if (first === '客' || first === '客场') return 'away';
+      return '';
+    };
+    const getHeaderIndex = (headers, words) => {
+      for (let hi = 0; hi < headers.length; hi++) {
+        const h = compact(headers[hi]);
+        if (words.some(w => h.includes(w))) return hi;
+      }
+      return -1;
+    };
+    const getRateByIndex = (cells, idx) => {
+      if (idx < 0) return '';
+      return pctFromText(cells[idx]) || pctFromText(cells[idx + 1]) || pctFromText(cells[idx - 1]);
+    };
+    const oneCharSeq = (cells, re) => {
+      const out = cells.map(compact).filter(c => re.test(c));
+      return out.length >= 3 ? out.join(' ') : '';
+    };
+    const hasTrendData = trend => !!(trend && (
+      (trend.winRates && trend.winRates.some(Boolean)) ||
+      (trend.bigBallRates && trend.bigBallRates.some(Boolean)) ||
+      trend.last6Asian || trend.last6OU
+    ));
+    const toTrend = (parsed, owner) => {
+      const venueBig = owner === 'away' ? (parsed.big.away || parsed.big.home) : (parsed.big.home || parsed.big.away);
+      return {
+        winRates: [parsed.win.total || '', parsed.win.home || '', parsed.win.away || '', parsed.win.last6 || ''],
+        bigBallRates: [parsed.big.total || '', venueBig || '', parsed.big.last6 || ''],
+        last6Asian: parsed.last6Asian || '',
+        last6OU: parsed.last6OU || '',
+        source: parsed.source || ''
+      };
+    };
+    const parseTrendTable = tbl => {
+      const rows = Array.from(tbl.querySelectorAll('tr'));
+      const parsed = { win: {}, big: {}, last6Asian: '', last6OU: '', source: 'content-table' };
+      let headers = [];
+      rows.slice(0, 4).some(row => {
+        const cells = getCells(row);
+        if (cells.join(' ').includes('赢盘率') || cells.join(' ').includes('大球率')) {
+          headers = cells;
+          return true;
+        }
+        return false;
+      });
+      const winIdx = getHeaderIndex(headers, ['赢盘率', '赢率']);
+      const bigIdx = getHeaderIndex(headers, ['大球率']);
+      rows.forEach(row => {
+        const cells = getCells(row);
+        if (!cells.length) return;
+        const rowText = cells.join(' ');
+        const rowCompact = compact(rowText);
+        const label = rowLabel(cells, rowCompact);
+        if (!label) return;
+
+        let winRate = getRateByIndex(cells, winIdx);
+        let bigRate = getRateByIndex(cells, bigIdx);
+        const winLabelPos = rowText.indexOf('赢盘率');
+        const bigLabelPos = rowText.indexOf('大球率');
+        if (!winRate && winLabelPos >= 0) winRate = pctFromText(rowText.slice(winLabelPos));
+        if (!bigRate && bigLabelPos >= 0) bigRate = pctFromText(rowText.slice(bigLabelPos));
+        if (!winRate && rowCompact.includes('赢盘')) {
+          const pcts = rowText.match(/\d{1,3}(?:\.\d+)?\s*%/g) || [];
+          if (pcts.length) winRate = pctFromText(pcts[pcts.length - 1]);
+        }
+        if (!bigRate && rowCompact.includes('大球')) {
+          const pcts = rowText.match(/\d{1,3}(?:\.\d+)?\s*%/g) || [];
+          if (pcts.length) bigRate = pctFromText(pcts[pcts.length - 1]);
+        }
+        if (winRate) parsed.win[label] = winRate;
+        if (bigRate) parsed.big[label] = bigRate;
+        if (label === 'last6') {
+          parsed.last6Asian = parsed.last6Asian || oneCharSeq(cells, /^[赢输走]$/);
+          parsed.last6OU = parsed.last6OU || oneCharSeq(cells, /^[大小走]$/);
+        }
+      });
+      return (Object.keys(parsed.win).length || Object.keys(parsed.big).length || parsed.last6Asian || parsed.last6OU) ? parsed : null;
+    };
+    const tableOwner = tbl => {
+      const homeName = result.matchInfo.home || '';
+      const awayName = result.matchInfo.away || '';
+      let ctx = '';
+      let node = tbl.previousElementSibling;
+      for (let step = 0; node && step < 8; step++, node = node.previousElementSibling) ctx += ' ' + node.textContent;
+      const near = ctx || tbl.textContent || '';
+      if (homeName && near.includes(homeName) && (!awayName || !near.includes(awayName))) return 'home';
+      if (awayName && near.includes(awayName) && (!homeName || !near.includes(homeName))) return 'away';
+      return '';
+    };
+
+    const trendTables = [];
+    tables.forEach((tbl, idx) => {
+      const tblText = tbl.textContent || '';
+      if (!/(赢盘率|大球率|近6场盘路走势|盘路走势)/.test(tblText)) return;
+      const parsed = parseTrendTable(tbl);
+      if (parsed) trendTables.push({ owner: tableOwner(tbl), parsed, idx });
+    });
+    result._debug = { textLen: text.length, tables: tables.length, trendTables: trendTables.map(x => ({ idx: x.idx, owner: x.owner, win: x.parsed.win, big: x.parsed.big })) };
+
+    const pending = [];
+    trendTables.forEach(item => {
+      if (item.owner === 'home' && !hasTrendData(result.handicapTrend.home)) result.handicapTrend.home = toTrend(item.parsed, 'home');
+      else if (item.owner === 'away' && !hasTrendData(result.handicapTrend.away)) result.handicapTrend.away = toTrend(item.parsed, 'away');
+      else pending.push(item);
+    });
+    pending.forEach(item => {
+      if (!hasTrendData(result.handicapTrend.home)) result.handicapTrend.home = toTrend(item.parsed, 'home');
+      else if (!hasTrendData(result.handicapTrend.away)) result.handicapTrend.away = toTrend(item.parsed, 'away');
+    });
+
+    if (!hasTrendData(result.handicapTrend.home) || !hasTrendData(result.handicapTrend.away)) {
+      const rates = [...text.matchAll(/(?:赢盘率[\s\S]{0,40}?(\d{1,3}\.?\d*)%|(\d{1,3}\.?\d*)%[\s\S]{0,20}?赢盘率)/g)].map(m => m[1] || m[2]);
+      const bigRates = [...text.matchAll(/(?:大球率[\s\S]{0,40}?(\d{1,3}\.?\d*)%|(\d{1,3}\.?\d*)%[\s\S]{0,20}?大球率)/g)].map(m => m[1] || m[2]);
+      if (!hasTrendData(result.handicapTrend.home)) {
+        result.handicapTrend.home.winRates = rates.slice(0, 4);
+        result.handicapTrend.home.bigBallRates = bigRates.slice(0, 3);
+        result.handicapTrend.home.source = 'content-text-fallback';
+      }
+      if (!hasTrendData(result.handicapTrend.away)) {
+        result.handicapTrend.away.winRates = rates.slice(4, 8);
+        result.handicapTrend.away.bigBallRates = bigRates.slice(3, 6);
+        result.handicapTrend.away.source = 'content-text-fallback';
+      }
+    }
+
+    // 富统计表：入球分布、半全场、进球数单双、进球时间。旧逻辑没有解析这些表，导致 analysis 页面有数据但报告为空。
+    const tableContextText = tbl => {
+      let ctx = '';
+      let node = tbl.previousElementSibling;
+      for (let step = 0; node && step < 10; step++, node = node.previousElementSibling) ctx = ` ${node.textContent}${ctx}`;
+      return compact(`${ctx} ${tbl.textContent || ''}`);
+    };
+    const numericRows = tbl => {
+      const out = [];
+      Array.from(tbl.querySelectorAll('tr')).forEach(row => {
+        const cells = getCells(row).map(c => compact(c).replace(/（/g, '(').replace(/）/g, ')')).filter(Boolean);
+        if (!cells.length) return;
+        const label = cells[0];
+        if (!/^(总|主|客|主场|客场)$/.test(label)) return;
+        const values = cells.slice(1).filter(c => /^-?\d+(?:\.\d+)?(?:\([^)]*\))?$/.test(c) || /^\d+(?:\.\d+)?%\[\d+场\]$/.test(c));
+        if (values.length) out.push({ label, values });
+      });
+      return out;
+    };
+    const normalizeVenueLabel = label => label === '主场' ? '主' : (label === '客场' ? '客' : label);
+    const rowsToObject = (rows, headers) => {
+      const obj = {};
+      rows.forEach(r => {
+        const key = normalizeVenueLabel(r.label);
+        obj[key] = {};
+        headers.forEach((h, i) => { obj[key][h] = r.values[i] || ''; });
+      });
+      return obj;
+    };
+    const parsePercentCell = v => {
+      const s = String(v || '').replace(/（/g, '(').replace(/）/g, ')');
+      const m = s.match(/(\d+)\((\d+(?:\.\d+)?)%\)/);
+      return m ? { games: m[1], pct: m[2] } : { games: s, pct: '' };
+    };
+    const richOwner = (tbl, ctx) => {
+      let owner = tableOwner(tbl);
+      const homeName = compact(result.matchInfo.home || '');
+      const awayName = compact(result.matchInfo.away || '');
+      if (!owner && homeName && ctx.includes(homeName) && (!awayName || !ctx.includes(awayName))) owner = 'home';
+      if (!owner && awayName && ctx.includes(awayName) && (!homeName || !ctx.includes(homeName))) owner = 'away';
+      if (!owner && ctx.includes('主队') && !ctx.includes('客队')) owner = 'home';
+      if (!owner && ctx.includes('客队') && !ctx.includes('主队')) owner = 'away';
+      return owner;
+    };
+    const pickRich = (list, owner, fallbackIndex) => {
+      const byOwner = list.find(x => x.owner === owner);
+      if (byOwner) return byOwner.data;
+      const hasOwner = list.some(x => x.owner);
+      return !hasOwner && list[fallbackIndex] ? list[fallbackIndex].data : null;
+    };
+    const rich = { goalDist: [], halfFull: [], singleDouble: [], goalTime: [], firstGoalTime: [] };
+    tables.forEach(tbl => {
+      const tt = compact(tbl.textContent || '');
+      const ctx = tableContextText(tbl);
+      const rows = numericRows(tbl);
+      if (!rows.length) return;
+      const owner = richOwner(tbl, ctx);
+      if ((/0球1球2球3球4\+/.test(tt) || /入球数.*上半场.*下半场/.test(ctx)) && rows[0].values.length >= 7) {
+        rich.goalDist.push({ owner, data: rowsToObject(rows, ['0球','1球','2球','3球','4+','上半场','下半场']) });
+      } else if ((/胜胜.*胜和.*胜负.*和胜.*和和.*和负.*负胜.*负和.*负负/.test(tt) || (ctx.includes('半全场') && tt.includes('胜胜') && tt.includes('负负'))) && rows[0].values.length >= 9) {
+        rich.halfFull.push({ owner, data: rowsToObject(rows, ['胜胜','胜和','胜负','和胜','和和','和负','负胜','负和','负负']) });
+      } else if ((tt.includes('大小走单双') || (ctx.includes('进球数/单双') && tt.includes('大') && tt.includes('小') && tt.includes('单') && tt.includes('双'))) && rows[0].values.length >= 5) {
+        const sdObj = rowsToObject(rows, ['大','小','走','单','双']);
+        ['总','主','客'].forEach(k => {
+          if (!sdObj[k]) return;
+          Object.keys(sdObj[k]).forEach(h => { sdObj[k][h] = parsePercentCell(sdObj[k][h]); });
+        });
+        rich.singleDouble.push({ owner, data: sdObj });
+      } else if (tt.includes('1-10') && (tt.includes('81-90+') || tt.includes('81-90')) && rows[0].values.length >= 10) {
+        const item = { owner, data: rowsToObject(rows, ['1-10','11-20','21-30','31-40','41-45','46-50','51-60','61-70','71-80','81-90+']) };
+        if (/第一个进球|第一個進球|首个进球|首個進球/.test(ctx)) rich.firstGoalTime.push(item);
+        else rich.goalTime.push(item);
+      }
+    });
+    result.recentGoalDistribution.home = pickRich(rich.goalDist, 'home', 0);
+    result.recentGoalDistribution.away = pickRich(rich.goalDist, 'away', 1);
+    result.halfFull.home = pickRich(rich.halfFull, 'home', 0);
+    result.halfFull.away = pickRich(rich.halfFull, 'away', 1);
+    result.goalSingleDouble.home = pickRich(rich.singleDouble, 'home', 0);
+    result.goalSingleDouble.away = pickRich(rich.singleDouble, 'away', 1);
+    if (result.goalSingleDouble.home?.['总']) {
+      const hsd = result.goalSingleDouble.home['总'];
+      result.goalSingleDouble.homeTotal = { big: hsd['大'], small: hsd['小'], draw: hsd['走'], odd: hsd['单'], even: hsd['双'] };
+    }
+    if (result.goalSingleDouble.away?.['总']) {
+      const asd = result.goalSingleDouble.away['总'];
+      result.goalSingleDouble.awayTotal = { big: asd['大'], small: asd['小'], draw: asd['走'], odd: asd['单'], even: asd['双'] };
+    }
+    result.goalTimeDistribution.home = pickRich(rich.goalTime, 'home', 0);
+    result.goalTimeDistribution.away = pickRich(rich.goalTime, 'away', 1);
+    result.goalTimeDistribution.homeFirst = pickRich(rich.firstGoalTime, 'home', 0);
+    result.goalTimeDistribution.awayFirst = pickRich(rich.firstGoalTime, 'away', 1);
+    result.goalTimeDistribution.rows = rich.goalTime.map(x => x.data);
+    result.goalTimeDistribution.firstRows = rich.firstGoalTime.map(x => x.data);
+
+    const safeAvg = (a, b) => {
+      a = parseFloat(a); b = parseFloat(b);
+      return Number.isFinite(a) && Number.isFinite(b) && b > 0 ? (a / b).toFixed(2) : '';
+    };
+    const calcSeason = (stats, venueKey) => {
+      const total = stats?.total || {};
+      const venue = stats?.[venueKey] || {};
+      const last6 = stats?.last6 || {};
+      return {
+        record: {
+          total: total.played ? { winPct: total.winRate || '', winGames: total.win || '', drawGames: total.draw || '', lossGames: total.loss || '' } : null,
+          venue: venue.played ? { winPct: venue.winRate || '', winGames: venue.win || '', drawGames: venue.draw || '', lossGames: venue.loss || '' } : null
+        },
+        goals: {
+          total: total.played ? { goalsFor: total.goalsFor || '', goalsAgainst: total.goalsAgainst || '', avgGoal: safeAvg(total.goalsFor, total.played), avgLoss: safeAvg(total.goalsAgainst, total.played) } : null,
+          venue: venue.played ? { goalsFor: venue.goalsFor || '', goalsAgainst: venue.goalsAgainst || '', avgGoal: safeAvg(venue.goalsFor, venue.played), avgLoss: safeAvg(venue.goalsAgainst, venue.played) } : null,
+          last6: last6.played ? { goalsFor: last6.goalsFor || '', goalsAgainst: last6.goalsAgainst || '', avgGoal: safeAvg(last6.goalsFor, last6.played), avgLoss: safeAvg(last6.goalsAgainst, last6.played) } : null
+        }
+      };
+    };
+    result.seasonComparison.home = calcSeason(result.homeStats, 'home');
+    result.seasonComparison.away = calcSeason(result.awayStats, 'away');
+
+    const cellNumber = cell => {
+      const clean = compact(cell).replace(/\[\d+(?:\.\d+)?场\]/g, '');
+      const nums = clean.match(/\d+(?:\.\d+)?/g) || [];
+      return nums.find(n => n.includes('.')) || nums[nums.length - 1] || '';
+    };
+    const readLabeledNumber = (cells, labels) => {
+      for (let ci = 0; ci < cells.length; ci++) {
+        const c = compact(cells[ci]);
+        if (!labels.some(label => c.includes(label))) continue;
+        const inline = cellNumber(c);
+        if (inline) return inline;
+        for (let j = ci + 1; j < Math.min(cells.length, ci + 5); j++) {
+          const n = cellNumber(cells[j]);
+          if (n) return n;
+        }
+      }
+      return '';
+    };
+    const parseGoalStatTable = tbl => {
+      const ctx = tableContextText(tbl);
+      if (!/(得失球统计|平均入球|平均进球|平均失球|场均入球|场均进球|场均失球)/.test(ctx)) return null;
+      const flat = [];
+      Array.from(tbl.querySelectorAll('tr')).forEach(row => getCells(row).forEach(cell => flat.push(cell)));
+      const parsed = {
+        owner: ctx.includes('主队得失球统计') ? 'home' : (ctx.includes('客队得失球统计') ? 'away' : richOwner(tbl, ctx)),
+        games: (ctx.match(/\[(\d+(?:\.\d+)?)场\]/) || [,''])[1],
+        goalsFor: readLabeledNumber(flat, ['入球数','进球数','总入球','总进球']),
+        goalsAgainst: readLabeledNumber(flat, ['失球数','总失球']),
+        avgGoal: readLabeledNumber(flat, ['平均入球','平均进球','场均入球','场均进球','均入球','均进球']),
+        avgLoss: readLabeledNumber(flat, ['平均失球','场均失球','均失球'])
+      };
+      return (parsed.avgGoal || parsed.avgLoss || parsed.goalsFor || parsed.goalsAgainst) ? parsed : null;
+    };
+    const mergeGoalStat = (side, parsed) => {
+      if (!parsed) return;
+      const comp = result.seasonComparison[side] || { record: {}, goals: {} };
+      comp.record = comp.record || {};
+      comp.goals = comp.goals || {};
+      const total = Object.assign({}, comp.goals.total || {});
+      if (parsed.games && !total.played) total.played = parsed.games;
+      if (parsed.goalsFor) total.goalsFor = parsed.goalsFor;
+      if (parsed.goalsAgainst) total.goalsAgainst = parsed.goalsAgainst;
+      if (parsed.avgGoal) total.avgGoal = parsed.avgGoal;
+      else if (!total.avgGoal) total.avgGoal = safeAvg(total.goalsFor, total.played);
+      if (parsed.avgLoss) total.avgLoss = parsed.avgLoss;
+      else if (!total.avgLoss) total.avgLoss = safeAvg(total.goalsAgainst, total.played);
+      comp.goals.total = total;
+      result.seasonComparison[side] = comp;
+    };
+    const goalStatTables = Array.from(tables).map(parseGoalStatTable).filter(Boolean);
+    const goalOwnerKnown = goalStatTables.some(x => x.owner);
+    const homeGoalStat = goalStatTables.find(x => x.owner === 'home') || (!goalOwnerKnown ? goalStatTables[0] : null);
+    const awayGoalStat = goalStatTables.find(x => x.owner === 'away') || (!goalOwnerKnown ? goalStatTables[1] : null);
+    mergeGoalStat('home', homeGoalStat);
+    mergeGoalStat('away', awayGoalStat);
+
+    result.dataComparison.home = Object.assign(result.dataComparison.home || {}, result.seasonComparison.home.goals.total || {});
+    result.dataComparison.away = Object.assign(result.dataComparison.away || {}, result.seasonComparison.away.goals.total || {});
+
+    const homeGoals = result.seasonComparison.home.goals.total || {};
+    const awayGoals = result.seasonComparison.away.goals.total || {};
+    const hf = parseFloat(homeGoals.avgGoal);
+    const ha = parseFloat(homeGoals.avgLoss);
+    const af = parseFloat(awayGoals.avgGoal);
+    const aa = parseFloat(awayGoals.avgLoss);
+    if (Number.isFinite(hf) || Number.isFinite(ha) || Number.isFinite(af) || Number.isFinite(aa)) {
+      result.recentStats = {
+        homeFor: Number.isFinite(hf) ? hf : undefined,
+        homeAgainst: Number.isFinite(ha) ? ha : undefined,
+        awayFor: Number.isFinite(af) ? af : undefined,
+        awayAgainst: Number.isFinite(aa) ? aa : undefined,
+        leagueAvg: 1.35,
+        source: goalStatTables.length ? 'analysis-goal-stat-table' : 'analysis-season-comparison'
+      };
+    }
+    result._debug = Object.assign(result._debug || {}, {
+      richTables: { goalDist: rich.goalDist.length, halfFull: rich.halfFull.length, singleDouble: rich.singleDouble.length, goalTime: rich.goalTime.length, firstGoalTime: rich.firstGoalTime.length },
+      goalStatTables: goalStatTables.map(x => ({ owner: x.owner, games: x.games, avgGoal: x.avgGoal, avgLoss: x.avgLoss, goalsFor: x.goalsFor, goalsAgainst: x.goalsAgainst })),
+      recentStats: result.recentStats || null
+    });
+
+    return result;
+  }
+
+  // ===== 亚让盘提取 =====
+  function extractAsian() {
+    const result = { companies: [], summary: {}, keyOdds: {} };
+    const text = document.body.innerText;
+
+    // 升降盘
+    result.summary.up        = (text.match(/升盘[_\s]*(\d+)/) || [,'0'])[1];
+    result.summary.down      = (text.match(/降盘[_\s]*(\d+)/) || [,'0'])[1];
+    result.summary.highWater = (text.match(/高水[_\s]*(\d+)/) || [,'0'])[1];
+    result.summary.lowWater  = (text.match(/低水[_\s]*(\d+)/) || [,'0'])[1];
+
+    const HAND_RE = /^(?:受让两球半|受让两球\/两球半|受让两球|受让球半\/两球|受让球半|受让一球\/球半|受让一球|受让半球\/一球|受让半球|受让平手\/半球|平手\/半球|半球\/一球|一球\/球半|球半\/两球|两球\/两球半|两球半\/三球|平手|半球|一球|球半|两球|两球半|三球)$/;
+    const HAND_TOKEN_RE = /受让两球半|受让两球\/两球半|受让两球|受让球半\/两球|受让球半|受让一球\/球半|受让一球|受让半球\/一球|受让半球|受让平手\/半球|平手\/半球|半球\/一球|一球\/球半|球半\/两球|两球\/两球半|两球半\/三球|平手|半球|一球|球半|两球|两球半|三球/g;
+    const WATER_RE = /^[01]\.\d{2}$/;
+    const WATER_TOKEN_RE = /(^|[^\d.])([01]\.\d{2})(?![\d.])/g;
+    const SKIP_COMPANY_RE = /^(公司|初|即时|历史|主队|客队|盘|多盘|公司多盘|最大值|最小值|平均值)$/;
+    const extractWaterTokens = cells => {
+      const out = [];
+      cells.forEach(cell => {
+        const text = String(cell || '').replace(/\u00a0/g, ' ');
+        let m;
+        while ((m = WATER_TOKEN_RE.exec(text)) !== null) out.push(m[2]);
+        WATER_TOKEN_RE.lastIndex = 0;
+      });
+      return out;
+    };
+    const extractAsianLineTokens = cells => {
+      const out = [];
+      cells.forEach(cell => {
+        const text = String(cell || '').replace(/\s+/g, '');
+        let m;
+        while ((m = HAND_TOKEN_RE.exec(text)) !== null) if (HAND_RE.test(m[0])) out.push(m[0]);
+        HAND_TOKEN_RE.lastIndex = 0;
+      });
+      return out;
+    };
+
+    // 遍历表格行
+    const rows = document.querySelectorAll('table tr');
+    const companiesData = [];
+    let currentCompany = null;
+
+    rows.forEach(row => {
+      const tds = Array.from(row.querySelectorAll('td'));
+      const cells = tds.map(c => c.textContent.trim().replace(/\s+/g, ' '));
+      if (cells.length < 4) return;
+
+      const lineIdx = cells.findIndex(c => extractAsianLineTokens([c]).length > 0);
+      if (lineIdx < 0) return;
+      const nums = extractWaterTokens(cells);
+      const lines = extractAsianLineTokens(cells);
+      if (nums.length < 4 || lines.length < 1) return;
+
+      let companyName = '';
+      for (let ni = 0; ni < Math.min(lineIdx, tds.length); ni++) {
+        const candidate = String(tds[ni].textContent || '').trim().replace(/[*★\s\n\t]/g, '').substring(0, 10);
+        if (!candidate) continue;
+        if (/^盘[2-9]$/.test(candidate) || WATER_RE.test(candidate) || HAND_RE.test(candidate)) continue;
+        if (SKIP_COMPANY_RE.test(candidate)) continue;
+        companyName = candidate;
+        break;
+      }
+      if (SKIP_COMPANY_RE.test(companyName)) return;
+      companiesData.push({
+        name: companyName || `C${companiesData.length+1}`,
+        initialHome: nums[0], initialHandicap: lines[0],
+        initialAway: nums[1],
+        currentHome: nums[2],
+        currentHandicap: lines[lines.length > 1 ? 1 : 0],
+        currentAway: nums[3]
+      });
+    });
+
+    result.companies = companiesData.slice(0, 15);
+
+    // 如果表格方式没有数据，用正则
+    if (companiesData.length === 0) {
+      const LINES = '受让两球半|受让两球\\/两球半|受让两球|受让球半\\/两球|受让球半|受让一球\\/球半|受让一球|受让半球\\/一球|受让半球|受让平手\\/半球|平手\\/半球|半球\\/一球|一球\\/球半|球半\\/两球|两球\\/两球半|两球半\\/三球|平手|半球|一球|球半|两球|两球半|三球';
+      const re = new RegExp(`([01]\\.\\d{2})\\s+(${LINES})\\s+([01]\\.\\d{2})`, 'g');
+      const all = [];
+      let m;
+      while ((m = re.exec(text)) !== null) all.push({ home: m[1], line: m[2], away: m[3] });
+
+      for (let i = 0; i < all.length - 1; i += 2) {
+        companiesData.push({
+          name: `C${Math.floor(i/2)+1}`,
+          initialHome: all[i].home, initialHandicap: all[i].line, initialAway: all[i].away,
+          currentHome: all[i+1].home, currentHandicap: all[i+1].line, currentAway: all[i+1].away
+        });
+      }
+      result.companies = companiesData.slice(0, 15);
+    }
+
+    if (result.companies[0]) result.keyOdds.ao    = { name: '澳门', ...result.companies[0] };
+    if (result.companies[1]) result.keyOdds.crown = { name: '皇冠', ...result.companies[1] };
+    result.keyOdds.allCurrent = result.companies.map(c => ({
+      home: c.currentHome, line: c.currentHandicap, away: c.currentAway
+    }));
+
+    return result;
+  }
+
+  // ===== 大小球提取 =====
+  function extractOverUnder() {
+    const result = { companies: [], summary: {}, keyOdds: {}, allOdds: [] };
+    const text = document.body.innerText || '';
+    const clean = v => String(v || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const compact = v => clean(v).replace(/\s+/g, '');
+
+    result.summary.up   = (text.match(/升盘[_\s]*(\d+)/) || [,'0'])[1];
+    result.summary.down = (text.match(/降盘[_\s]*(\d+)/) || [,'0'])[1];
+
+    const WATER_RE = /^[01]\.\d{2}$/;
+    const WATER_TOKEN_RE = /(^|[^\d.])([01]\.\d{2})(?![\d.])/g;
+    const LINE_RE = /^\d+(?:\.\d+)?(?:\/\d+(?:\.\d+)?)?$/;
+    const LINE_TOKEN_RE = /(^|[^\d.])(\d+(?:\.\d+)?(?:\/\d+(?:\.\d+)?)?)(?![\d.])/g;
+    const SUB_RE = /^盘[2-9]$/;
+    const isLine = v => {
+      const s = clean(v);
+      if (!LINE_RE.test(s) || WATER_RE.test(s)) return false;
+      const parts = s.split('/').map(x => parseFloat(x));
+      if (!parts.length || parts.some(n => !Number.isFinite(n) || n < 1.5 || n > 5.5 || Math.abs(n * 4 - Math.round(n * 4)) > 1e-6)) return false;
+      return parts.length === 1 || (parts.length === 2 && Math.abs(parts[1] - parts[0] - 0.5) < 1e-6);
+    };
+    const extractWaterTokens = cells => {
+      const out = [];
+      cells.forEach(cell => {
+        const text = String(cell || '').replace(/\u00a0/g, ' ');
+        let m;
+        while ((m = WATER_TOKEN_RE.exec(text)) !== null) out.push(m[2]);
+        WATER_TOKEN_RE.lastIndex = 0;
+      });
+      return out;
+    };
+    const extractOuLineTokens = cells => {
+      const out = [];
+      cells.forEach(cell => {
+        const text = String(cell || '').replace(/\u00a0/g, ' ');
+        let m;
+        while ((m = LINE_TOKEN_RE.exec(text)) !== null) if (isLine(m[2])) out.push(m[2]);
+        LINE_TOKEN_RE.lastIndex = 0;
+      });
+      return out;
+    };
+    const normalizeCompanyName = raw => compact(raw).replace(/[*★]/g, '').replace(/(走势|详情|主流|多盘)$/g, '').substring(0, 15);
+    const isValidName = name => {
+      name = normalizeCompanyName(name);
+      return !!name && name.length <= 15 && !/^(公司|初|即时|大球|小球|进球数|盘口|多盘|升盘|降盘|最大值|最小值|平均值)$/.test(name) && /[\u4e00-\u9fa5A-Za-z]/.test(name);
+    };
+    const extractName = (row, lineIdx = -1) => {
+      const tds = Array.from(row.querySelectorAll('td'));
+      const end = Math.min(lineIdx < 0 ? tds.length : lineIdx, tds.length);
+      for (let i = 0; i < end; i++) {
+        const name = normalizeCompanyName(tds[i].textContent || '');
+        if (isValidName(name) && !SUB_RE.test(name) && !WATER_RE.test(name) && !isLine(name)) return name;
+      }
+      return '';
+    };
+    const makeLine = (waters, lines) => {
+      if (waters.length < 4 || lines.length < 1) return null;
+      return {
+        initialOver: waters[0], initialLine: lines[0], initialUnder: waters[1],
+        currentOver: waters[2], currentLine: lines[lines.length > 1 ? 1 : 0], currentUnder: waters[3]
+      };
+    };
+
+    let currentCompany = null;
+    let lastCompanyName = '';
+    document.querySelectorAll('table tr').forEach(row => {
+      const cells = Array.from(row.querySelectorAll('td')).map(c => clean(c.textContent));
+      if (!cells.length) return;
+      const waters = extractWaterTokens(cells);
+      const lines = extractOuLineTokens(cells);
+      const line = makeLine(waters, lines);
+      if (!line) return;
+
+      const lineIdx = cells.findIndex(c => extractOuLineTokens([c]).length > 0);
+      const subLabel = cells.slice(0, Math.max(lineIdx, 3)).map(compact).find(c => SUB_RE.test(c)) || '';
+      if (subLabel && currentCompany) {
+        currentCompany.subLines = currentCompany.subLines || [];
+        currentCompany.subLines.push({ label: subLabel, ...line });
+        return;
+      }
+
+      let name = extractName(row, lineIdx);
+      if (!isValidName(name) && lastCompanyName) name = lastCompanyName;
+      if (!isValidName(name)) return;
+      lastCompanyName = name;
+      currentCompany = { name, mainLine: line, subLines: [] };
+      result.companies.push(currentCompany);
+      result.allOdds.push(line);
+    });
+
+    if (result.companies.length === 0) {
+      const lineRe = /([01]\.\d{2})\s+((?:\d+(?:\/\d+)?(?:\.\d+)?))\s+([01]\.\d{2})/g;
+      const allOdds = [];
+      let m;
+      while ((m = lineRe.exec(text)) !== null) {
+        if (isLine(m[2])) allOdds.push({ over: m[1], line: m[2], under: m[3] });
+      }
+      for (let i = 0; i < allOdds.length - 1; i += 2) {
+        const line = {
+          initialOver: allOdds[i].over, initialLine: allOdds[i].line, initialUnder: allOdds[i].under,
+          currentOver: allOdds[i+1].over, currentLine: allOdds[i+1].line, currentUnder: allOdds[i+1].under
+        };
+        result.companies.push({ name: `C${Math.floor(i / 2) + 1}`, mainLine: line, subLines: [] });
+        result.allOdds.push(line);
+      }
+    }
+
+    if (result.companies[0]) result.keyOdds.ao    = { name: result.companies[0].name, ...result.companies[0].mainLine };
+    if (result.companies[1]) result.keyOdds.crown = { name: result.companies[1].name, ...result.companies[1].mainLine };
+    result.keyOdds.allCurrent = result.companies.map(c => ({ name: c.name, over: c.mainLine.currentOver, line: c.mainLine.currentLine, under: c.mainLine.currentUnder }));
+
+    const lineCounts = {};
+    result.companies.forEach(c => {
+      const line = c.mainLine && c.mainLine.currentLine;
+      if (line) lineCounts[line] = (lineCounts[line] || 0) + 1;
+    });
+    result.summary.mainLine = Object.entries(lineCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+    result.summary.lineConsensus = lineCounts;
+
+    return result;
+  }
+
+  // ===== 胜平负 / 欧赔提取 =====
+  function extractWinDrawWin() {
+    const result = { companies: [], summary: {}, keyOdds: {}, allOdds: [], _debug: { textLen: document.body.innerText.length, tables: document.querySelectorAll('table').length, parsedRows: 0 } };
+    const text = document.body.innerText || '';
+    const clean = v => String(v || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const compact = v => clean(v).replace(/\s+/g, '');
+    const fmt = n => Number.isFinite(n) ? Number(n).toFixed(2) : '';
+    const fmtPct = n => Number.isFinite(n) ? (n * 100).toFixed(2) + '%' : '';
+    const isSkipName = name => {
+      name = compact(name);
+      return !name || /^(公司|所有|主流|交易所|非交易所|初|即|主|和|客|主胜|客胜|返还率|凯利指数|变化时间|历史指数|筛选|设置自定义)$/.test(name) || /初盘|即时|最高值|最低值|平均值|高级筛选|删除选中|保留选中|导出Excel|欧亚转换|主胜率|和率|平率|客胜率|概率|返还|凯利|变化时间/.test(name);
+    };
+    const isOdds = n => { n = parseFloat(n); return Number.isFinite(n) && n >= 1.01 && n <= 30; };
+    const calcReturnRate = (win, draw, loss) => {
+      win = parseFloat(win); draw = parseFloat(draw); loss = parseFloat(loss);
+      return win > 0 && draw > 0 && loss > 0 ? win * draw * loss / (win * draw + draw * loss + win * loss) : null;
+    };
+    const isValidTriple = (win, draw, loss) => {
+      if (!isOdds(win) || !isOdds(draw) || !isOdds(loss)) return false;
+      const rate = calcReturnRate(win, draw, loss);
+      return !!rate && rate >= 0.70 && rate <= 1.05;
+    };
+    const calcProbabilities = (win, draw, loss) => {
+      const rate = calcReturnRate(win, draw, loss);
+      win = parseFloat(win); draw = parseFloat(draw); loss = parseFloat(loss);
+      if (!rate || !(win > 0 && draw > 0 && loss > 0)) return null;
+      return { win: fmtPct(rate / win), draw: fmtPct(rate / draw), loss: fmtPct(rate / loss), returnRate: fmtPct(rate), _decimal: { win: rate / win, draw: rate / draw, loss: rate / loss } };
+    };
+    const normalizeCompanyName = raw => {
+      let name = compact(raw).replace(/[×√□☑★]/g, '');
+      name = name.replace(/^[\s\-:：]+/, '');
+      if (!/^\d+\*?[（(][^）)]{1,20}[）)]$/.test(name)) {
+        name = name.replace(/^[\d一二三四五六七八九十]+[、.．\-]\s*/, '');
+      }
+      name = name.replace(/\[[^\]]*\]/g, '').replace(/[【】]/g, '').replace(/(走势|详情|历史|主流|交易所|非交易所)$/g, '').trim();
+      return name.length > 24 ? name.substring(0, 24) : name;
+    };
+    const isValidCompanyName = name => {
+      name = normalizeCompanyName(name);
+      if (!name || name.length > 24) return false;
+      if (/^\d+(?:\.\d+)?%?$/.test(name)) return false;
+      if (/^[（(][^）)]*[）)]$/.test(name)) return false;
+      if (/^[\d\s]+$/.test(name)) return false;
+      if (isSkipName(name)) return false;
+      return /[\u4e00-\u9fa5A-Za-z]/.test(name) || /^\d+\*?[（(][^）)]{1,20}[）)]$/.test(name);
+    };
+    const pickChangeTime = rowText => (String(rowText || '').match(/(?:(?:\d{4}[-/])?\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2})/g) || []).pop() || '';
+    const recentChange = timeText => {
+      const m = String(timeText || '').match(/(?:(\d{4})[-/])?(\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})/);
+      if (!m) return false;
+      const now = new Date();
+      const dt = new Date(m[1] ? parseInt(m[1], 10) : now.getFullYear(), parseInt(m[2], 10) - 1, parseInt(m[3], 10), parseInt(m[4], 10), parseInt(m[5], 10));
+      const diff = now.getTime() - dt.getTime();
+      return diff >= 0 && diff <= 30 * 60 * 1000;
+    };
+    const isMetaOddsCell = cell => !cell || cell.includes('%') || /凯利|概率|主胜率|和率|平率|客胜率|返还|变化时间|历史指数|统计|主客同/.test(cell);
+    const parseOddsFromCells = (cells, start = 1) => {
+      const odds = [];
+      for (let i = start; i < cells.length; i++) {
+        const cell = clean(cells[i]);
+        if (isMetaOddsCell(cell)) continue;
+        const re = /(^|[^\d.])(\d{1,2}\.\d{2,3})(?![\d.])/g;
+        let m;
+        while ((m = re.exec(cell)) !== null) {
+          const v = parseFloat(m[2]);
+          if (isOdds(v)) odds.push(v);
+        }
+      }
+      return odds;
+    };
+    const parseLeadingOddsFromCells = (cells, start = 1, maxCount = 3) => {
+      const odds = [];
+      for (let i = Math.max(0, start); i < cells.length; i++) {
+        const cell = clean(cells[i]);
+        if (isMetaOddsCell(cell)) continue;
+        const m = cell.match(/^\s*(\d{1,2}\.\d{2,3})\s*$/) || cell.match(/(^|[^\d.])(\d{1,2}\.\d{2,3})(?![\d.])/);
+        const raw = m ? (m[2] || m[1]) : '';
+        const v = parseFloat(raw);
+        if (!isOdds(v)) {
+          // oddslist 的赔率三列后面紧跟概率/返还率/凯利列。遇到 70~100 这类百分比数值时，
+          // 说明已经越过赔率列，必须停止，避免把“和率/客胜率/凯利”误当成下一组三项赔率。
+          if (odds.length >= 3 && Number.isFinite(v) && v >= 30) break;
+          continue;
+        }
+        odds.push(v);
+        if (odds.length >= maxCount) break;
+      }
+      if (odds.length >= 6 && isValidTriple(odds[0], odds[1], odds[2]) && isValidTriple(odds[3], odds[4], odds[5])) return odds.slice(0, 6);
+      return odds.length >= 3 && isValidTriple(odds[0], odds[1], odds[2]) ? odds.slice(0, 3) : null;
+    };
+    const firstValidTriple = (values, startAt = 0) => {
+      for (let i = startAt; i <= values.length - 3; i++) {
+        if (isValidTriple(values[i], values[i + 1], values[i + 2])) return [values[i], values[i + 1], values[i + 2]];
+      }
+      return null;
+    };
+    const addCompany = entry => {
+      if (!entry || !isValidCompanyName(entry.name) || !isValidTriple(entry.currentWin, entry.currentDraw, entry.currentLoss)) return;
+      entry.name = normalizeCompanyName(entry.name);
+      const key = [entry.name, entry.currentWin, entry.currentDraw, entry.currentLoss].join('|');
+      if (result.companies.some(c => [c.name, c.currentWin, c.currentDraw, c.currentLoss].join('|') === key)) return;
+      result.companies.push(entry);
+      result.allOdds.push(entry);
+    };
+    const makeEntry = (name, odds, rowText, source) => {
+      if (!isValidCompanyName(name) || odds.length < 3) return null;
+      const entry = { name: normalizeCompanyName(name), source };
+      let initial = null;
+      let current = null;
+      if (odds.length >= 6 && isValidTriple(odds[0], odds[1], odds[2]) && isValidTriple(odds[3], odds[4], odds[5])) {
+        initial = [odds[0], odds[1], odds[2]];
+        current = [odds[3], odds[4], odds[5]];
+      } else {
+        current = firstValidTriple(odds);
+      }
+      if (!current) return null;
+      if (initial) {
+        entry.initialWin = fmt(initial[0]); entry.initialDraw = fmt(initial[1]); entry.initialLoss = fmt(initial[2]);
+      } else {
+        entry.initialWin = ''; entry.initialDraw = ''; entry.initialLoss = '';
+      }
+      entry.currentWin = fmt(current[0]); entry.currentDraw = fmt(current[1]); entry.currentLoss = fmt(current[2]);
+      const time = pickChangeTime(rowText);
+      if (time) entry.changeTime = time;
+      return entry;
+    };
+    const extractName = (row, cells) => {
+      let name = '';
+      const firstTd = row.querySelector('td');
+      if (firstTd) {
+        firstTd.childNodes.forEach(node => { if (!name && node.nodeType === 3) name = clean(node.textContent); });
+        if (!name) {
+          const a = firstTd.querySelector('a');
+          name = a ? clean(a.textContent) : clean(firstTd.textContent);
+        }
+      }
+      name = normalizeCompanyName(name || cells[0] || '');
+      if (isValidCompanyName(name)) return name;
+      for (let i = 0; i < Math.min(3, cells.length); i++) {
+        const cand = normalizeCompanyName(cells[i]);
+        if (isValidCompanyName(cand)) return cand;
+      }
+      return '';
+    };
+    const detectRowKind = (cells, rowCompact) => {
+      for (let i = 0; i < Math.min(4, cells.length); i++) {
+        const c = compact(cells[i]);
+        if (/^(初|初盘|初赔|初始)$/.test(c)) return 'initial';
+        if (/^(即|即时|即赔)$/.test(c)) return 'current';
+      }
+      if (/^初盘/.test(rowCompact)) return 'initial';
+      if (/^即时/.test(rowCompact)) return 'current';
+      return '';
+    };
+    const pairedRows = {};
+    let lastCompanyName = '';
+
+    document.querySelectorAll('table tr').forEach(row => {
+      const cells = Array.from(row.querySelectorAll('th,td')).map(c => clean(c.textContent));
+      if (cells.length < 4) return;
+      const rowText = cells.join(' ');
+      if (!/\d{1,2}\.\d{2,3}/.test(rowText)) return;
+      const rowKind = detectRowKind(cells, compact(rowText));
+      const ownName = extractName(row, cells);
+      let name = ownName;
+      let inheritedName = false;
+      if (!name && lastCompanyName && (rowKind || /^\d{1,2}\.\d{2,3}$/.test(compact(cells[0])))) {
+        name = lastCompanyName;
+        inheritedName = true;
+      }
+      if (!name) return;
+      if (ownName && !/^(初|即|初盘|即时|初赔|即赔)$/.test(ownName)) lastCompanyName = ownName;
+
+      const triple = parseLeadingOddsFromCells(cells, inheritedName ? 0 : 1, 6);
+      if (triple) {
+        const entry = pairedRows[name] || { name, source: 'content-table-paired' };
+        const time = pickChangeTime(rowText);
+        if (triple.length >= 6) {
+          entry.initialWin = fmt(triple[0]); entry.initialDraw = fmt(triple[1]); entry.initialLoss = fmt(triple[2]);
+          entry.currentWin = fmt(triple[3]); entry.currentDraw = fmt(triple[4]); entry.currentLoss = fmt(triple[5]);
+          if (time) entry.changeTime = time;
+        } else if (rowKind === 'initial' || (!rowKind && inheritedName && !time)) {
+          entry.initialWin = fmt(triple[0]); entry.initialDraw = fmt(triple[1]); entry.initialLoss = fmt(triple[2]);
+        } else if (rowKind === 'current' || time || !entry.currentWin) {
+          entry.currentWin = fmt(triple[0]); entry.currentDraw = fmt(triple[1]); entry.currentLoss = fmt(triple[2]);
+          if (time) entry.changeTime = time;
+        } else if (!entry.initialWin) {
+          entry.initialWin = fmt(triple[0]); entry.initialDraw = fmt(triple[1]); entry.initialLoss = fmt(triple[2]);
+        }
+        pairedRows[name] = entry;
+        result._debug.parsedRows++;
+        return;
+      }
+
+      const odds = parseOddsFromCells(cells, inheritedName ? 0 : 1);
+      const entry = makeEntry(name, odds, rowText, 'content-table');
+      if (entry) {
+        addCompany(entry);
+        result._debug.parsedRows++;
+      }
+    });
+
+    Object.keys(pairedRows).forEach(name => {
+      const entry = pairedRows[name];
+      if (!entry.currentWin && entry.initialWin) {
+        entry.currentWin = entry.initialWin;
+        entry.currentDraw = entry.initialDraw;
+        entry.currentLoss = entry.initialLoss;
+      }
+      addCompany(entry);
+    });
+
+    if (result.companies.length === 0) {
+      text.split(/\n+/).forEach(line => {
+        line = clean(line);
+        const firstNum = line.search(/\d{1,2}\.\d{2,3}/);
+        if (firstNum <= 0) return;
+        const name = normalizeCompanyName(line.slice(0, firstNum));
+        if (!isValidCompanyName(name)) return;
+        const odds = [];
+        const re = /(^|[^\d.])(\d{1,2}\.\d{2,3})(?![\d.])/g;
+        let m;
+        while ((m = re.exec(line)) !== null && odds.length < 3) {
+          const v = parseFloat(m[2]);
+          if (isOdds(v)) odds.push(v);
+        }
+        addCompany(makeEntry(name, odds, line, 'content-text-fallback'));
+      });
+    }
+
+    const normalizeMarketDirection = companies => {
+      const excluded = [];
+      const rows = companies.filter(c => isValidTriple(c.currentWin, c.currentDraw, c.currentLoss));
+      if (rows.length < 3) return excluded;
+      const trusted = rows.filter(c => {
+        const rate = calcReturnRate(c.currentWin, c.currentDraw, c.currentLoss);
+        const w = parseFloat(c.currentWin);
+        const d = parseFloat(c.currentDraw);
+        const l = parseFloat(c.currentLoss);
+        const maxOdds = Math.max(w, d, l);
+        // 交易所/反向盘也可能有高返还率，例如 25.xx/18.xx/1.0x。
+        // 方向共识只能由非极端普通公司行建立，否则会把反向盘当成可信样本。
+        return rate >= 0.88 && maxOdds <= 12 && Math.abs(w - l) >= 0.30;
+      });
+      let homeFav = 0;
+      let awayFav = 0;
+      trusted.forEach(c => {
+        const w = parseFloat(c.currentWin);
+        const l = parseFloat(c.currentLoss);
+        if (w < l) homeFav++;
+        else if (l < w) awayFav++;
+      });
+      const total = homeFav + awayFav;
+      if (total < 3) return excluded;
+      const side = homeFav / total >= 0.67 ? 'home' : (awayFav / total >= 0.67 ? 'away' : '');
+      if (!side) return excluded;
+      rows.forEach(c => {
+        const w = parseFloat(c.currentWin);
+        const d = parseFloat(c.currentDraw);
+        const l = parseFloat(c.currentLoss);
+        if (!(w > 0 && l > 0)) return;
+        const reversed = side === 'home' ? w > l : l > w;
+        const ratio = Math.max(w, l) / Math.max(1.01, Math.min(w, l));
+        if (!reversed || ratio < 1.50) return;
+        const maxOdds = Math.max(w, d, l);
+        if (maxOdds > 15 || d > 12) {
+          c.excluded = true;
+          c.excludeReason = `extreme-reversed-${side}-favorite-source`;
+          excluded.push({ ...c });
+          return;
+        }
+        const before = { currentWin: c.currentWin, currentLoss: c.currentLoss, initialWin: c.initialWin || '', initialLoss: c.initialLoss || '' };
+        const oldCurrentWin = c.currentWin;
+        c.currentWin = c.currentLoss;
+        c.currentLoss = oldCurrentWin;
+        if (isValidTriple(c.initialWin, c.initialDraw, c.initialLoss)) {
+          const oldInitialWin = c.initialWin;
+          c.initialWin = c.initialLoss;
+          c.initialLoss = oldInitialWin;
+        }
+        c.orientationCorrected = true;
+        c.orientationCorrection = { reason: `trusted-return-${side}-favorite-consensus`, before };
+      });
+      return excluded;
+    };
+    result.excludedCompanies = (result.excludedCompanies || []).concat(normalizeMarketDirection(result.companies));
+    result.companies = result.companies.filter(c => !c.excluded);
+
+    const avg = rows => {
+      rows = rows.filter(x => x && isValidTriple(x.win, x.draw, x.loss));
+      if (!rows.length) return null;
+      const sum = rows.reduce((acc, x) => ({ win: acc.win + parseFloat(x.win), draw: acc.draw + parseFloat(x.draw), loss: acc.loss + parseFloat(x.loss) }), { win: 0, draw: 0, loss: 0 });
+      return { win: fmt(sum.win / rows.length), draw: fmt(sum.draw / rows.length), loss: fmt(sum.loss / rows.length) };
+    };
+    result.summary.count = result.companies.length;
+    result.summary.averageCurrent = avg(result.companies.map(c => ({ win: c.currentWin, draw: c.currentDraw, loss: c.currentLoss })));
+    result.summary.averageInitial = avg(result.companies.map(c => ({ win: c.initialWin, draw: c.initialDraw, loss: c.initialLoss })));
+    let marketProbability = null;
+    if (result.summary.averageCurrent) {
+      const calc = calcProbabilities(result.summary.averageCurrent.win, result.summary.averageCurrent.draw, result.summary.averageCurrent.loss);
+      if (calc) {
+        marketProbability = calc._decimal;
+        result.summary.impliedAverage = { win: calc.win, draw: calc.draw, loss: calc.loss };
+        result.summary.averageReturnRate = calc.returnRate;
+      }
+    }
+    result.companies.forEach(c => {
+      const cp = calcProbabilities(c.currentWin, c.currentDraw, c.currentLoss);
+      if (cp) {
+        c.returnRate = cp.returnRate;
+        c.currentReturnRate = cp.returnRate;
+        c.probabilities = { win: cp.win, draw: cp.draw, loss: cp.loss };
+        c.currentProbabilities = c.probabilities;
+      }
+      const ip = calcProbabilities(c.initialWin, c.initialDraw, c.initialLoss);
+      if (ip) {
+        c.initialReturnRate = ip.returnRate;
+        c.initialProbabilities = { win: ip.win, draw: ip.draw, loss: ip.loss };
+      }
+      if (marketProbability && isValidTriple(c.currentWin, c.currentDraw, c.currentLoss)) {
+        const kw = marketProbability.win * parseFloat(c.currentWin);
+        const kd = marketProbability.draw * parseFloat(c.currentDraw);
+        const kl = marketProbability.loss * parseFloat(c.currentLoss);
+        c.kelly = { win: fmt(kw), draw: fmt(kd), loss: fmt(kl) };
+        c.kellyRisk = { win: kw > 1, draw: kd > 1, loss: kl > 1 };
+      }
+      if (c.changeTime) c.recent30 = recentChange(c.changeTime);
+    });
+    result.keyOdds.allCurrent = result.companies.map(c => ({ name: c.name, win: c.currentWin, draw: c.currentDraw, loss: c.currentLoss }));
+    if (result.companies[0]) result.keyOdds.ao = { name: result.companies[0].name, ...result.companies[0] };
+    if (result.companies[1]) result.keyOdds.crown = { name: result.companies[1].name, ...result.companies[1] };
+    return result;
+  }
+
+  function extractWinDrawWinStats() {
+    const text = document.body.innerText || '';
+    const result = { company: '36*(英国)', source: 'goalCount', rows: [], summary: {}, recent30: [], _debug: { textLen: text.length, tables: document.querySelectorAll('table').length, parsedRows: 0 } };
+    const clean = v => String(v || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const compact = v => clean(v).replace(/\s+/g, '');
+    const fmt = n => Number.isFinite(n) ? Number(n).toFixed(2) : '';
+    const fmtPct = n => Number.isFinite(n) ? (n * 100).toFixed(2) + '%' : '';
+    const calcReturnRate = (win, draw, loss) => {
+      win = parseFloat(win); draw = parseFloat(draw); loss = parseFloat(loss);
+      return win > 0 && draw > 0 && loss > 0 ? win * draw * loss / (win * draw + draw * loss + win * loss) : null;
+    };
+    const calcProbabilities = (win, draw, loss) => {
+      const rate = calcReturnRate(win, draw, loss);
+      win = parseFloat(win); draw = parseFloat(draw); loss = parseFloat(loss);
+      return rate ? { win: fmtPct(rate / win), draw: fmtPct(rate / draw), loss: fmtPct(rate / loss), returnRate: fmtPct(rate) } : null;
+    };
+    const parseType = (cells, rowText) => {
+      const joined = compact(rowText);
+      for (let i = 0; i < Math.min(3, cells.length); i++) {
+        const c = compact(cells[i]);
+        if (/^(初盘|初|初赔|初始)$/.test(c)) return 'initial';
+        if (/^(即时|即|即赔)$/.test(c)) return 'current';
+      }
+      if (/^初盘/.test(joined)) return 'initial';
+      if (/^即时/.test(joined)) return 'current';
+      return '';
+    };
+    const parseStatsRow = (cells, rowText) => {
+      const type = parseType(cells, rowText);
+      if (!type) return null;
+      const oddsItems = [];
+      cells.forEach((c, idx) => {
+        const cell = clean(c);
+        if (!cell || cell.includes('%') || /概率|返还|凯利|主胜率|和率|平率|客胜率/.test(cell)) return;
+        const re = /(^|[^\d.])(\d{1,2}\.\d{2,3})(?![\d.])/g;
+        let m;
+        while ((m = re.exec(cell)) !== null) {
+          const v = parseFloat(m[2]);
+          if (v >= 1.01 && v <= 30) oddsItems.push({ value: v, cellIndex: idx });
+        }
+      });
+      if (oddsItems.length < 3) return null;
+      const rateCheck = calcReturnRate(oddsItems[0].value, oddsItems[1].value, oddsItems[2].value);
+      if (!rateCheck || rateCheck < 0.70 || rateCheck > 1.05) return null;
+      const counts = [];
+      for (let i = oddsItems[2].cellIndex + 1; i < cells.length; i++) {
+        if (/^\d+$/.test(clean(cells[i]))) counts.push(parseInt(clean(cells[i]), 10));
+      }
+      const win = fmt(oddsItems[0].value), draw = fmt(oddsItems[1].value), loss = fmt(oddsItems[2].value);
+      const prob = calcProbabilities(win, draw, loss);
+      return {
+        type,
+        label: type === 'initial' ? '初盘' : '即时',
+        win,
+        draw,
+        loss,
+        total: counts[0] || '',
+        winCount: counts[1] || '',
+        drawCount: counts[2] || '',
+        lossCount: counts[3] || '',
+        probabilities: prob ? { win: prob.win, draw: prob.draw, loss: prob.loss } : null,
+        returnRate: prob ? prob.returnRate : ''
+      };
+    };
+
+    const companyM = clean(document.title + ' ' + text.slice(0, 300)).match(/(\d+\*?\([^)]{1,20}\))\s*欧指统计表/);
+    if (companyM) result.company = companyM[1];
+    document.querySelectorAll('table tr').forEach(row => {
+      const cells = Array.from(row.querySelectorAll('th,td')).map(c => clean(c.textContent));
+      const parsed = parseStatsRow(cells, cells.join(' '));
+      if (parsed) {
+        result.rows.push(parsed);
+        result._debug.parsedRows++;
+      }
+    });
+    if (result.rows.length === 0) {
+      text.split(/\n+/).forEach(line => {
+        line = clean(line);
+        if (!/^(初盘|即时|初|即)\s+\d/.test(line)) return;
+        const parsed = parseStatsRow(line.split(/\s+/), line);
+        if (parsed) result.rows.push(parsed);
+      });
+    }
+    const summaryM = text.match(/共\s*(\d+)\s*场[\s\S]{0,60}?主胜\s*(\d{1,3}(?:\.\d+)?)%[\s\S]{0,30}?(?:和局|平局|和)\s*(\d{1,3}(?:\.\d+)?)%[\s\S]{0,30}?客胜\s*(\d{1,3}(?:\.\d+)?)%/);
+    if (summaryM) result.summary.sampleRates = { total: summaryM[1], win: summaryM[2] + '%', draw: summaryM[3] + '%', loss: summaryM[4] + '%' };
+    const recentM = text.match(/近\s*30\s*场[\s\S]{0,80}?([胜平负和]{10,})/);
+    if (recentM) result.recent30 = recentM[1].replace(/和/g, '平').split('').slice(0, 30);
+    result.summary.initial = result.rows.find(r => r.type === 'initial') || null;
+    result.summary.current = result.rows.find(r => r.type === 'current') || null;
+    return result;
+  }
+
+  // ===== 角球提取 =====
+  function extractCorner() {
+    const result = { companies: [], allOdds: [], keyOdds: {}, summary: {} };
+    const text = document.body.innerText || '';
+    const clean = v => String(v || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const compact = v => clean(v).replace(/\s+/g, '');
+    const WATER_RE = /^[01]\.\d{2}$/;
+    const LINE_RE = /^\d{1,2}(?:\.\d)?(?:\/\d{1,2}(?:\.\d)?)?$/;
+    const isLine = v => LINE_RE.test(clean(v)) && parseFloat(v) >= 7 && parseFloat(v) <= 14;
+    const normalizeCompanyName = raw => compact(raw).replace(/[*★]/g, '').replace(/(走势|详情|主流)$/g, '').substring(0, 15);
+    const isValidName = name => {
+      name = normalizeCompanyName(name);
+      return !!name && name.length <= 15 && !/^(公司|初|即时|大球|小球|角球数|盘口)$/.test(name) && /[\u4e00-\u9fa5A-Za-z]/.test(name);
+    };
+    const extractName = row => {
+      const td = row.querySelector('td');
+      if (!td) return '';
+      let raw = '';
+      td.childNodes.forEach(node => { if (!raw && node.nodeType === 3) raw = clean(node.textContent); });
+      if (!raw) {
+        const a = td.querySelector('a');
+        raw = a ? clean(a.textContent) : clean(td.textContent);
+      }
+      return normalizeCompanyName(raw);
+    };
+    const makeLine = (waters, lines) => {
+      if (waters.length < 4 || lines.length < 1) return null;
+      return {
+        initialOver: waters[0], initialLine: lines[0], initialUnder: waters[1],
+        currentOver: waters[waters.length > 4 ? 3 : 2], currentLine: lines[lines.length > 1 ? 1 : 0], currentUnder: waters[waters.length > 4 ? 4 : 3]
+      };
+    };
+
+    document.querySelectorAll('table tr').forEach(row => {
+      const cells = Array.from(row.querySelectorAll('td')).map(c => clean(c.textContent));
+      if (!cells.length) return;
+      const waters = cells.filter(c => WATER_RE.test(c));
+      const lines = cells.filter(isLine);
+      const line = makeLine(waters, lines);
+      if (!line) return;
+      let name = extractName(row);
+      if (!isValidName(name)) name = `C${result.companies.length + 1}`;
+      const entry = { name, ...line };
+      result.companies.push(entry);
+      result.allOdds.push(entry);
+    });
+
+    if (result.companies.length === 0) {
+      const re = /([01]\.\d{2})\s+(\d{1,2}(?:\.\d)?(?:\/\d{1,2}(?:\.\d)?)?)\s+([01]\.\d{2})/g;
+      const all = [];
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const line = parseFloat(m[2]);
+        if (line >= 7 && line <= 14) all.push({ over: m[1], line: m[2], under: m[3] });
+      }
+      for (let i = 0; i < all.length - 1; i += 2) {
+        const entry = {
+          name: `C${Math.floor(i / 2) + 1}`,
+          initialOver: all[i].over, initialLine: all[i].line, initialUnder: all[i].under,
+          currentOver: all[i+1].over, currentLine: all[i+1].line, currentUnder: all[i+1].under
+        };
+        result.companies.push(entry);
+        result.allOdds.push(entry);
+      }
+    }
+
+    if (result.companies[0]) {
+      result.mainLine  = result.companies[0].currentLine;
+      result.mainOver  = result.companies[0].currentOver;
+      result.mainUnder = result.companies[0].currentUnder;
+      result.keyOdds.ao = { name: result.companies[0].name, ...result.companies[0] };
+    }
+    if (result.companies[1]) result.keyOdds.crown = { name: result.companies[1].name, ...result.companies[1] };
+    result.keyOdds.allCurrent = result.companies.map(c => ({ name: c.name, over: c.currentOver, line: c.currentLine, under: c.currentUnder }));
+
+    return result;
+  }
+
+  // 等页面加载完毕后提取
+  if (document.readyState === 'complete') {
+    extractAndSend();
+  } else {
+    window.addEventListener('load', extractAndSend);
+  }
+
+  // 监听来自 background 的请求（按需提取）
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.type === 'EXTRACT_NOW') {
+      let data = null;
+      if (url.includes('/analysis/')) data = extractAnalysis();
+      else if (url.includes('1x2.titan007.com/oddslist/')) data = extractWinDrawWin();
+      else if (url.includes('goalCount.aspx')) data = extractWinDrawWinStats();
+      else if (url.includes('AsianOdds_n.aspx')) data = extractAsian();
+      else if (url.includes('OverDown_n.aspx')) data = extractOverUnder();
+      else if (url.includes('Corner.aspx')) data = extractCorner();
+      sendResponse({ ok: true, data });
+    }
+    return true;
+  });
+})();

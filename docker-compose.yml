@@ -1,0 +1,43 @@
+services:
+  football-auto:
+    build:
+      context: .
+    init: true
+    env_file:
+      - ${FOOTBALL_ENV_FILE:-.env}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/health').then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status))).then(j=>process.exit(j.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: unless-stopped
+    networks:
+      - football-net
+
+  # napcat:
+  #   image: mlikiowa/napcat-docker:latest
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./napcat:/app/napcat/config
+  #   ports:
+  #     - "3001:3001"
+  #   # 如需 OneBot/NapCat 对接，再按实际配置启用。
+
+networks:
+  football-net:
+    driver: bridge
