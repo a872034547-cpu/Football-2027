@@ -292,25 +292,21 @@ app.post(
   '/api/collect/today',
   asyncRoute(async (req, res) => {
     const date = normalizeOptionalString(req.body?.date) ?? normalizeOptionalString(req.query.date) ?? todayInTimezone();
-    const jobId = db.startJobRun('collect_today', { date, trigger: 'api' });
+    const pushOnComplete = req.body?.push !== false;
+    const jobId = db.startJobRun('daily_pipeline', { date, trigger: 'api_collect' });
 
-    try {
-      const { matches, source } = await collectTodayMatches({
-        date,
-        titanBaseUrl: config.titanBaseUrl,
-        timezone: APP_TIMEZONE,
-      });
-      let saved = 0;
-      for (const m of matches) {
-        db.upsertMatch({ ...m, source_json: m });
-        saved++;
-      }
-      db.finishJobRun(jobId, 'success', `采集 ${saved} 场`, { date, source, count: saved });
-      res.json({ ok: true, date, source, count: saved, matches });
-    } catch (err) {
-      db.finishJobRun(jobId, 'error', err.message, { date });
-      throw err;
-    }
+    // 立即返回 202，完整流水线后台执行
+    res.status(202).json({
+      ok: true,
+      message: '采集+分析+报告+推送流水线已启动，请稍后查询 /api/reports/daily 获取结果',
+      jobId,
+      date,
+    });
+
+    runDailyPipeline(jobId, date, pushOnComplete).catch((err) => {
+      console.error('[collect_today] 流水线未捕获错误', err);
+      try { db.finishJobRun(jobId, 'error', err.message, { date }); } catch (_) {}
+    });
   }),
 );
 
