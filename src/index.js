@@ -1,5 +1,7 @@
 import express from 'express';
 import cron from 'node-cron';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
 import { config, maskSecret } from './config.js';
 import * as db from './db/index.js';
@@ -15,6 +17,8 @@ import * as marketTimelineDb from './db/marketTimelineDb.js';
 import * as clvDb from './clv/clvDb.js';
 
 const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const APP_PORT = Number(config.APP_PORT ?? config.appPort ?? process.env.PORT ?? 3000);
 const APP_TIMEZONE = config.TIMEZONE ?? config.timezone ?? process.env.TZ ?? 'Asia/Shanghai';
@@ -42,6 +46,9 @@ let resultSyncTask = null;
 let shuttingDown = false;
 
 app.use(express.json({ limit: '1mb' }));
+
+// 静态文件服务（前端管理页面）
+app.use('/admin', express.static(join(__dirname, '../public')));
 
 // ─── 工具函数 ─────────────────────────────────────────────────
 
@@ -685,7 +692,7 @@ async function runDailyPipeline(jobId, date, pushOnComplete = false) {
     analysisNote: `本次分析使用量化引擎 + 专业盘口分析 + 风险评估 + server-only增强层（校准/CLV/评级/蒙特卡洛/回测门禁），共处理 ${analysisResults.length} 场`,
   };
 
-  db.upsertDailyPortfolio({ date, ...portfolio, payload_json: portfolio });
+  db.upsertDailyPortfolio({ date, business_date: date, ...portfolio, payload_json: portfolio });
   console.log(`[daily_pipeline] 日报生成完成 date=${date}`);
 
   // Step 5: 推送

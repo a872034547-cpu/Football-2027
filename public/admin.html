@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>⚽ 足球预测助手 · 管理后台</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+    header {
+      background: linear-gradient(135deg, #1a1f2e 0%, #16213e 100%);
+      border-bottom: 1px solid #2d3748;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { font-size: 20px; font-weight: 700; color: #63b3ed; }
+    header .status-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #68d391; display: inline-block; margin-right: 6px;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity: 1; } 50% { opacity: 0.4; }
+    }
+    .auth-bar {
+      background: #1a202c;
+      border-bottom: 1px solid #2d3748;
+      padding: 10px 24px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .auth-bar label { font-size: 13px; color: #a0aec0; }
+    .auth-bar input {
+      background: #2d3748; border: 1px solid #4a5568; border-radius: 6px;
+      color: #e2e8f0; padding: 6px 12px; font-size: 13px; width: 220px;
+    }
+    .auth-bar input:focus { outline: none; border-color: #63b3ed; }
+    .main { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 100px); }
+    .sidebar {
+      background: #1a1f2e;
+      border-right: 1px solid #2d3748;
+      padding: 16px 0;
+    }
+    .sidebar-section { padding: 8px 16px 4px; font-size: 11px; color: #718096; text-transform: uppercase; letter-spacing: 0.05em; }
+    .sidebar button {
+      display: flex; align-items: center; gap: 8px;
+      width: 100%; padding: 10px 16px;
+      background: none; border: none; cursor: pointer;
+      color: #a0aec0; font-size: 14px; text-align: left;
+      transition: all 0.15s;
+    }
+    .sidebar button:hover { background: #2d3748; color: #e2e8f0; }
+    .sidebar button.active { background: #2b4c7e; color: #90cdf4; border-right: 3px solid #63b3ed; }
+    .content { padding: 24px; overflow: auto; }
+    .card {
+      background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px;
+      padding: 20px; margin-bottom: 16px;
+    }
+    .card h2 { font-size: 16px; color: #90cdf4; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+    .btn {
+      padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;
+      font-size: 14px; font-weight: 600; transition: all 0.15s;
+    }
+    .btn-primary { background: #3182ce; color: #fff; }
+    .btn-primary:hover { background: #2b6cb0; }
+    .btn-success { background: #276749; color: #9ae6b4; }
+    .btn-success:hover { background: #22543d; }
+    .btn-warning { background: #744210; color: #fbd38d; }
+    .btn-warning:hover { background: #5f370e; }
+    .btn-danger { background: #742a2a; color: #feb2b2; }
+    .btn-danger:hover { background: #63171b; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
+    .result-box {
+      background: #0d1117; border: 1px solid #2d3748; border-radius: 8px;
+      padding: 14px; margin-top: 14px; font-family: monospace; font-size: 12px;
+      max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+      color: #a0aec0; line-height: 1.6;
+    }
+    .result-box.success { border-color: #276749; color: #9ae6b4; }
+    .result-box.error { border-color: #742a2a; color: #fc8181; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 99px;
+      font-size: 11px; font-weight: 600;
+    }
+    .badge-running { background: #2b4c7e; color: #90cdf4; }
+    .badge-success { background: #276749; color: #9ae6b4; }
+    .badge-error { background: #742a2a; color: #fc8181; }
+    .badge-unknown { background: #2d3748; color: #a0aec0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { padding: 10px 12px; text-align: left; color: #718096; font-weight: 500; border-bottom: 1px solid #2d3748; }
+    td { padding: 10px 12px; border-bottom: 1px solid #1a202c; }
+    tr:hover td { background: #1e2533; }
+    .loading { color: #63b3ed; font-style: italic; }
+    .input-row { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .input-row label { font-size: 13px; color: #a0aec0; min-width: 60px; }
+    .input-row input, .input-row select {
+      background: #2d3748; border: 1px solid #4a5568; border-radius: 6px;
+      color: #e2e8f0; padding: 7px 12px; font-size: 13px;
+    }
+    .input-row input:focus, .input-row select:focus { outline: none; border-color: #63b3ed; }
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .stat-item { background: #0d1117; border: 1px solid #2d3748; border-radius: 8px; padding: 14px; }
+    .stat-item .label { font-size: 11px; color: #718096; margin-bottom: 6px; }
+    .stat-item .value { font-size: 22px; font-weight: 700; color: #63b3ed; }
+    .page { display: none; }
+    .page.active { display: block; }
+    .toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: #276749; color: #9ae6b4; padding: 12px 20px;
+      border-radius: 8px; font-size: 14px; font-weight: 500;
+      transform: translateY(80px); opacity: 0; transition: all 0.3s;
+      z-index: 999;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.error { background: #742a2a; color: #fc8181; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚽ 足球预测助手</h1>
+  <div style="font-size:13px;color:#718096">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="serverTime">--</span>
+  </div>
+</header>
+
+<div class="auth-bar">
+  <label>Token：</label>
+  <input type="password" id="tokenInput" placeholder="输入 Admin Token" value="" />
+  <button class="btn btn-primary" onclick="saveToken()" style="padding:6px 14px;font-size:13px;">保存</button>
+</div>
+
+<div class="main">
+  <div class="sidebar">
+    <div class="sidebar-section">流水线</div>
+    <button onclick="showPage('pipeline')" id="nav-pipeline" class="active">🚀 触发 & 状态</button>
+    <div class="sidebar-section">数据</div>
+    <button onclick="showPage('report')" id="nav-report">📋 今日日报</button>
+    <button onclick="showPage('matches')" id="nav-matches">⚽ 比赛列表</button>
+    <div class="sidebar-section">推送</div>
+    <button onclick="showPage('push')" id="nav-push">📲 QQ 推送</button>
+    <button onclick="showPage('pushlogs')" id="nav-pushlogs">📜 推送日志</button>
+    <div class="sidebar-section">工具</div>
+    <button onclick="showPage('qa')" id="nav-qa">🤖 AI 问答</button>
+    <button onclick="showPage('elo')" id="nav-elo">📈 ELO 评级</button>
+    <button onclick="showPage('results')" id="nav-results">📉 结果同步</button>
+  </div>
+
+  <div class="content">
+
+    <!-- 流水线 -->
+    <div class="page active" id="page-pipeline">
+      <div class="card">
+        <h2>🚀 流水线操作</h2>
+        <div class="input-row">
+          <label>日期：</label>
+          <input type="date" id="pipelineDate" />
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="triggerCollect()">🔄 采集+分析+推送</button>
+          <button class="btn btn-warning" onclick="triggerDailyRun()">📊 仅分析日报</button>
+          <button class="btn btn-success" onclick="loadJobStatus()">🔃 刷新状态</button>
+        </div>
+        <div id="pipelineResult" class="result-box" style="display:none"></div>
+      </div>
+
+      <div class="card">
+        <h2>📋 Job 运行记录</h2>
+        <div id="jobTable"><span class="loading">加载中...</span></div>
+      </div>
+    </div>
+
+    <!-- 日报 -->
+    <div class="page" id="page-report">
+      <div class="card">
+        <h2>📋 今日日报</h2>
+        <div class="input-row">
+          <label>日期：</label>
+          <input type="date" id="reportDate" />
+          <button class="btn btn-primary" onclick="loadReport()">查询</button>
+        </div>
+        <div id="reportStat" class="stat-grid" style="display:none"></div>
+        <div id="reportResult" class="result-box" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- 比赛列表 -->
+    <div class="page" id="page-matches">
+      <div class="card">
+        <h2>⚽ 比赛列表</h2>
+        <div class="input-row">
+          <label>日期：</label>
+          <input type="date" id="matchDate" />
+          <button class="btn btn-primary" onclick="loadMatches()">查询</button>
+        </div>
+        <div id="matchTable"><span class="loading">点击查询</span></div>
+      </div>
+    </div>
+
+    <!-- QQ 推送 -->
+    <div class="page" id="page-push">
+      <div class="card">
+        <h2>📲 手动推送到 QQ</h2>
+        <div class="input-row">
+          <label>日期：</label>
+          <input type="date" id="pushDate" />
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-success" onclick="pushDaily()">📨 推送今日日报</button>
+        </div>
+        <div id="pushResult" class="result-box" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- 推送日志 -->
+    <div class="page" id="page-pushlogs">
+      <div class="card">
+        <h2>📜 推送日志</h2>
+        <button class="btn btn-primary" onclick="loadPushLogs()">🔃 加载日志</button>
+        <div id="pushLogTable" style="margin-top:14px"><span class="loading">点击加载</span></div>
+      </div>
+    </div>
+
+    <!-- AI 问答 -->
+    <div class="page" id="page-qa">
+      <div class="card">
+        <h2>🤖 AI 问答</h2>
+        <div class="input-row">
+          <input type="text" id="qaInput" placeholder="输入问题，如：今天哪些比赛值得关注？" style="flex:1;min-width:300px" />
+          <button class="btn btn-primary" onclick="sendQa()">发送</button>
+        </div>
+        <div id="qaResult" class="result-box" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- ELO -->
+    <div class="page" id="page-elo">
+      <div class="card">
+        <h2>📈 ELO 球队评级</h2>
+        <div class="input-row">
+          <input type="text" id="eloSearch" placeholder="搜索球队名（留空查全部）" style="flex:1" />
+          <button class="btn btn-primary" onclick="loadElo()">查询</button>
+        </div>
+        <div id="eloTable" style="margin-top:14px"><span class="loading">点击查询</span></div>
+      </div>
+    </div>
+
+    <!-- 结果同步 -->
+    <div class="page" id="page-results">
+      <div class="card">
+        <h2>📉 结果同步</h2>
+        <div class="input-row">
+          <label>日期：</label>
+          <input type="date" id="syncDate" />
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-warning" onclick="syncResults()">🔄 同步结果</button>
+          <button class="btn btn-primary" onclick="loadResults()">📋 查看历史结果</button>
+        </div>
+        <div id="syncResult" class="result-box" style="display:none"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const BASE = window.location.origin;
+  let TOKEN = localStorage.getItem('admin_token') || '';
+  if (TOKEN) document.getElementById('tokenInput').value = TOKEN;
+
+  // 初始化日期输入为今天
+  const today = new Date().toISOString().slice(0, 10);
+  ['pipelineDate','reportDate','matchDate','pushDate','syncDate'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = today;
+  });
+
+  function saveToken() {
+    TOKEN = document.getElementById('tokenInput').value.trim();
+    localStorage.setItem('admin_token', TOKEN);
+    showToast('Token 已保存');
+  }
+
+  function headers() {
+    return { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+  }
+
+  async function api(method, path, body) {
+    const opts = { method, headers: headers() };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(BASE + path, opts);
+    return res.json();
+  }
+
+  function showPage(name) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.sidebar button').forEach(b => b.classList.remove('active'));
+    document.getElementById('page-' + name).classList.add('active');
+    document.getElementById('nav-' + name).classList.add('active');
+    if (name === 'pipeline') loadJobStatus();
+  }
+
+  function showToast(msg, isError = false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isError ? ' error' : '');
+    setTimeout(() => t.className = 'toast', 2500);
+  }
+
+  function setResult(id, data, isError = false) {
+    const el = document.getElementById(id);
+    el.style.display = 'block';
+    el.className = 'result-box ' + (isError ? 'error' : 'success');
+    el.textContent = JSON.stringify(data, null, 2);
+  }
+
+  function badgeHtml(status) {
+    const map = { running: 'badge-running', success: 'badge-success', error: 'badge-error' };
+    return `<span class="badge ${map[status] || 'badge-unknown'}">${status}</span>`;
+  }
+
+  function fmtTime(iso) {
+    if (!iso) return '--';
+    return new Date(iso).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  }
+
+  // ─── 状态栏 ───
+  async function refreshStatus() {
+    try {
+      const data = await api('GET', '/api/jobs/status');
+      if (data.ok) {
+        document.getElementById('serverTime').textContent = fmtTime(data.time);
+        document.getElementById('statusDot').style.background = '#68d391';
+      }
+    } catch { document.getElementById('statusDot').style.background = '#fc8181'; }
+  }
+  setInterval(refreshStatus, 30000);
+  refreshStatus();
+
+  // ─── 流水线 ───
+  async function triggerCollect() {
+    const date = document.getElementById('pipelineDate').value;
+    setResult('pipelineResult', { status: '触发中...' });
+    const data = await api('POST', '/api/collect/today', { date });
+    setResult('pipelineResult', data, !data.ok);
+    showToast(data.ok ? '流水线已启动，稍后刷新状态' : '触发失败', !data.ok);
+    setTimeout(loadJobStatus, 1500);
+  }
+
+  async function triggerDailyRun() {
+    const date = document.getElementById('pipelineDate').value;
+    setResult('pipelineResult', { status: '触发中...' });
+    const data = await api('POST', '/api/jobs/daily/run', { date });
+    setResult('pipelineResult', data, !data.ok);
+    showToast(data.ok ? '分析流水线已启动' : '触发失败', !data.ok);
+    setTimeout(loadJobStatus, 1500);
+  }
+
+  async function loadJobStatus() {
+    const data = await api('GET', '/api/jobs/status?limit=15');
+    if (!data.ok) { document.getElementById('jobTable').innerHTML = '<span style="color:#fc8181">加载失败</span>'; return; }
+    const runs = data.job_runs || [];
+    if (!runs.length) { document.getElementById('jobTable').innerHTML = '<span style="color:#718096">暂无记录</span>'; return; }
+    let html = '<table><thead><tr><th>ID</th><th>任务</th><th>状态</th><th>开始时间</th><th>完成时间</th><th>消息</th></tr></thead><tbody>';
+    for (const r of runs) {
+      html += `<tr>
+        <td>${r.id}</td>
+        <td>${r.job_key}</td>
+        <td>${badgeHtml(r.status)}</td>
+        <td>${fmtTime(r.started_at)}</td>
+        <td>${fmtTime(r.finished_at)}</td>
+        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(r.message||'').replace(/"/g,'&quot;')}">${r.message || '--'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('jobTable').innerHTML = html;
+  }
+
+  // ─── 日报 ───
+  async function loadReport() {
+    const date = document.getElementById('reportDate').value;
+    const data = await api('GET', `/api/reports/daily?date=${date}`);
+    const r = data.report;
+    if (r) {
+      document.getElementById('reportStat').style.display = 'grid';
+      document.getElementById('reportStat').innerHTML = `
+        <div class="stat-item"><div class="label">总场数</div><div class="value">${r.totalMatches ?? '--'}</div></div>
+        <div class="stat-item"><div class="label">已采集详情</div><div class="value">${r.collectedDetails ?? '--'}</div></div>
+        <div class="stat-item"><div class="label">已分析</div><div class="value">${r.analyzedDetails ?? '--'}</div></div>
+        <div class="stat-item"><div class="label">稳健方案</div><div class="value">${r.stable?.length ?? 0}</div></div>
+        <div class="stat-item"><div class="label">平衡方案</div><div class="value">${r.balanced?.length ?? 0}</div></div>
+        <div class="stat-item"><div class="label">探索方案</div><div class="value">${r.explore?.length ?? 0}</div></div>
+      `;
+    } else {
+      document.getElementById('reportStat').style.display = 'none';
+    }
+    setResult('reportResult', data, !data.ok);
+  }
+
+  // ─── 比赛列表 ───
+  async function loadMatches() {
+    const date = document.getElementById('matchDate').value;
+    const data = await api('GET', `/api/matches?date=${date}&limit=100`);
+    if (!data.ok || !data.matches?.length) {
+      document.getElementById('matchTable').innerHTML = '<span style="color:#718096">暂无比赛</span>';
+      return;
+    }
+    let html = '<table><thead><tr><th>ID</th><th>联赛</th><th>主队</th><th>客队</th><th>开赛时间</th><th>状态</th></tr></thead><tbody>';
+    for (const m of data.matches) {
+      html += `<tr>
+        <td>${m.match_id || m.matchId || '--'}</td>
+        <td>${m.league || '--'}</td>
+        <td>${m.home || '--'}</td>
+        <td>${m.away || '--'}</td>
+        <td>${m.match_time || m.matchTime || '--'}</td>
+        <td>${m.status || '--'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('matchTable').innerHTML = html;
+  }
+
+  // ─── QQ 推送 ───
+  async function pushDaily() {
+    const date = document.getElementById('pushDate').value;
+    setResult('pushResult', { status: '推送中...' });
+    const data = await api('POST', '/api/push/daily', { date });
+    setResult('pushResult', data, !data.ok);
+    showToast(data.ok ? '推送成功！' : (data.error || '推送失败'), !data.ok);
+  }
+
+  // ─── 推送日志 ───
+  async function loadPushLogs() {
+    const data = await api('GET', '/api/push/logs?limit=50');
+    if (!data.ok || !data.logs?.length) {
+      document.getElementById('pushLogTable').innerHTML = '<span style="color:#718096">暂无日志</span>';
+      return;
+    }
+    let html = '<table><thead><tr><th>通道</th><th>状态</th><th>日期</th><th>消息</th><th>时间</th></tr></thead><tbody>';
+    for (const l of data.logs) {
+      html += `<tr>
+        <td>${l.channel || '--'}</td>
+        <td>${badgeHtml(l.status)}</td>
+        <td>${l.business_date || '--'}</td>
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.message || l.error || '--'}</td>
+        <td>${fmtTime(l.created_at)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('pushLogTable').innerHTML = html;
+  }
+
+  // ─── AI 问答 ───
+  async function sendQa() {
+    const question = document.getElementById('qaInput').value.trim();
+    if (!question) return showToast('请输入问题', true);
+    setResult('qaResult', { status: '思考中...' });
+    const data = await api('POST', '/api/qa', { question });
+    const el = document.getElementById('qaResult');
+    el.style.display = 'block';
+    el.className = 'result-box success';
+    el.textContent = data.answer || JSON.stringify(data, null, 2);
+  }
+
+  document.getElementById('qaInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') sendQa();
+  });
+
+  // ─── ELO ───
+  async function loadElo() {
+    const q = document.getElementById('eloSearch').value.trim();
+    const data = await api('GET', '/api/elo/teams?limit=100');
+    if (!data.ok || !data.teams?.length) {
+      document.getElementById('eloTable').innerHTML = '<span style="color:#718096">暂无数据</span>';
+      return;
+    }
+    let teams = data.teams;
+    if (q) teams = teams.filter(t => (t.team_key || '').includes(q) || (t.team_name || '').includes(q));
+    let html = '<table><thead><tr><th>球队</th><th>ELO</th><th>场数</th><th>更新时间</th></tr></thead><tbody>';
+    for (const t of teams.slice(0, 50)) {
+      html += `<tr>
+        <td>${t.team_name || t.team_key || '--'}</td>
+        <td style="color:#63b3ed;font-weight:700">${Math.round(t.elo_rating ?? t.rating ?? 1500)}</td>
+        <td>${t.match_count ?? '--'}</td>
+        <td>${fmtTime(t.updated_at)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('eloTable').innerHTML = html;
+  }
+
+  // ─── 结果同步 ───
+  async function syncResults() {
+    const date = document.getElementById('syncDate').value;
+    setResult('syncResult', { status: '同步中...' });
+    const data = await api('POST', '/api/results/sync', { date });
+    setResult('syncResult', data, !data.ok);
+    showToast(data.ok ? `同步完成 sync=${data.syncCount ?? 0}` : '同步失败', !data.ok);
+  }
+
+  async function loadResults() {
+    const date = document.getElementById('syncDate').value;
+    const data = await api('GET', `/api/results?date=${date}&limit=50`);
+    setResult('syncResult', data, !data.ok);
+  }
+
+  // 初始加载 job 状态
+  loadJobStatus();
+</script>
+</body>
+</html>
